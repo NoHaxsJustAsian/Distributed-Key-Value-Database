@@ -1,0 +1,351 @@
+#!/usr/bin/env python3
+
+import argparse
+import socket
+import time
+import json
+import select
+import struct
+import sys
+import math
+import os
+import random
+
+BROADCAST = "FFFF"
+
+class Replica:
+    def __init__(self, port, id, others):
+        # -- Starter Code --
+        self.port = port
+        self.id = id
+        self.others = others
+        # -- State --
+        self.current_term = 0
+        self.log = []  
+        self.commit_index = 0
+        self.last_applied = 0
+        self.next_index = {}
+        self.matchIndex = {}
+        self.election_timeout = random.randint(150, 300) / 1000
+        self.ongoing_election = False
+        self.voted_for = None
+        self.votes_received = 0
+        self.leader = BROADCAST
+        self.last_heartbeat = time.time()
+        self.datastore = {}
+
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.socket.bind(('localhost', 0))
+
+        print("Replica %s starting up" % self.id, flush=True)
+        hello = {"src": self.id, "dst": BROADCAST, "leader": BROADCAST, "type": "hello"}
+        self.send(hello)
+        print("Sent hello message: %s" % hello, flush=True)
+
+    '''
+    '''
+    def run(self):
+        while True:
+            rlist, _, _ = select.select([self.socket], [], [], 0.1)
+            for s in rlist:
+                data, addr = s.recvfrom(65535)
+                msg = data.decode('utf-8')
+                #print("Received message '%s'" % (msg,), flush=True)
+                request = json.loads(msg)
+
+                if request["type"] in ["get", "put"]:
+                    self.respond_to_client(request)
+                elif request["type"] == "hello":
+                    self.respond_to_raft_election(request)
+                elif request["type"] == "election_announcement":
+                    self.process_election_announcement(request)
+                elif request["type"] == "vote_request":
+                    self.process_vote_request(request)
+                elif request["type"] == "vote":
+                    self.process_vote(request)
+                elif request["type"] == "heartbeat":
+                    self.process_heartbeat(request)
+            if self.leader != self.id:
+                self.check_leader_timeout()
+            else:
+                self.send_heartbeats()
+                # self.send_append_entries()
+            
+            
+    '''
+    Sends a message to the client.
+    Params:
+        message: the message to send
+    '''
+    def send(self, message):
+        self.socket.sendto(json.dumps(message).encode('utf-8'), ('localhost', self.port))
+
+    '''
+    Responds to a client request if this replica is the leader.
+    Params:
+        request: the request from the client
+    '''
+    def respond_to_client(self, request):
+        if self.check_redirect(request):
+            self.process_client_request(request)
+
+    '''
+    If the election announcement is valid, this replica will enter the election state. Otherwise, it will ignore the message.
+    Params:
+        request: the request from the client
+    '''
+    def process_election_announcement(self, request):
+        if self.current_term < request["term"]:
+            self.ongoing_election = True
+            self.last_heartbeat = time.time()
+            self.current_term = request["term"]
+            self.leader = BROADCAST
+            self.voted_for = None
+            self.votes_received = 0
+
+    '''
+    Sends a vote message to the client who requested the vote.
+    Params:
+        request: the request from the client
+    '''
+    def vote(self, request):
+        vote = {
+            "src": self.id,
+            "dst": request['src'],
+            "leader": self.get_leader(),
+            "type": "vote",
+            "term": self.current_term
+        }
+        self.send(vote)
+        self.voted_for = request["src"]
+
+    '''
+    This method checks if the replica is the leader and sends a redirect message if it is not.
+    Params:
+        request: the request from the client
+    Returns:
+        True if the replica is the leader, False otherwise
+    '''
+    def check_redirect(self, request):
+        if self.id != self.leader:
+            redirect = {"src": self.id, "dst": request['src'], "leader": self.get_leader(), "type": "redirect", "MID": request['MID']}
+            self.send(redirect)
+            return False
+        else:
+            return True
+        
+    '''
+    Returns the leader of the replica or "FFFF" if it is unknown.
+    '''
+    def get_leader(self):
+        return self.leader if self.leader else BROADCAST
+
+    '''
+    This leader processes the client request and send back a response.
+    '''
+    def process_client_request(self, request):
+        if request["type"] == "get":
+            response = self.process_get_request(request)
+        elif request["type"] == "put":
+            response = self.process_put_request(request)     
+        self.append_to_log(request)
+        self.apply_log_entries()
+        self.replicate_log_entries()
+        self.send(response)
+
+    def replicate_log_entries(self):
+        for replica_id in self.others:
+            if replica_id != self.id:
+                self.send_append_entries()
+
+
+    '''
+    Attempts to send back a response with the key and value.
+    Params:
+        request: the request from the client
+    Returns:
+        Either an 'ok' message or a 'fail' message
+    '''
+    def process_get_request(self, request):
+        try:
+            val = self.datastore.get(request["key"])   
+            return {"src": self.id, "dst": request['src'], "leader": self.get_leader(), "type": "ok", "MID": request['MID'],
+                "value": val or ""}        
+        except KeyError:
+            return {"src": self.id, "dst": request['src'], "leader": self.get_leader(), "type": "fail", "MID": request['MID']}
+
+    '''
+    Attempts to enter the given key-value pair into the datastore.
+    Params:
+        request: the request from the client
+    '''
+    def process_put_request(self, request):
+        self.datastore[request["key"]] = request["value"]
+        return {"src": self.id, "dst": request['src'], "leader": self.get_leader(), "type": "ok", "MID": request['MID']}
+        # try:
+        #     self.datastore[request["key"]] = request["value"]
+        # except KeyError:
+        #     pass
+        # return {"src": self.id, "dst": request['src'], "leader": self.get_leader(), "type": "ok", "MID": request['MID']}
+    
+    '''
+    This replica will respond to the election announcement if it is a candidate or follower.
+    Params:
+        request: the request from the client
+    '''
+    def process_vote_request(self, request):
+        if self.current_term < request["term"]:
+            self.process_election_announcement(request)
+        if self.current_term == request["term"] and not self.voted_for and self.ongoing_election:
+            self.vote(request)
+    
+    '''
+    Processes the heartbeat message received from the leader.
+    '''
+    def process_heartbeat(self, request):
+        self.last_heartbeat = time.time()
+        self.leader = request["leader"]
+        if self.ongoing_election:
+            self.end_election()
+
+    '''
+    Processes the vote message received.
+    Params:
+        request: the request from the client
+    '''
+    def process_vote(self, request):
+        if self.ongoing_election and self.current_term == request["term"]:
+            self.votes_received += 1
+            if self.votes_received > math.floor(len(self.others) / 2):
+                self.leader = self.id
+                self.end_election()
+                self.send_heartbeats()
+
+    '''
+    Exits the election state for this replica.
+    '''
+    def end_election(self):
+        self.ongoing_election = False
+        self.voted_for = None
+        self.votes_received = 0
+        self.election_timeout = random.randint(150, 300) / 1000
+
+
+    '''
+    This method checks if the leader has timed out and starts a new election if it has.
+    '''
+    def check_leader_timeout(self):
+        current_time = time.time()
+        if current_time - self.last_heartbeat > self.election_timeout:
+            self.start_election()
+            self.election_timeout = random.randint(150, 300) / 1000
+
+    '''
+    Starts a new election by making itself a candidate and sending out election announcements and vote requests.
+    '''
+    def start_election(self):
+        for replica_id in self.others:
+            self.next_index[replica_id] = len(self.log) + 1
+        self.ongoing_election = True
+        self.current_term += 1
+        self.last_heartbeat = time.time()
+        self.leader = BROADCAST
+        self.voted_for = self.id
+        self.votes_received = 1
+        self.send_election_announcements()
+        self.send_vote_requests()
+
+    '''
+    Sends election announcements to all other replicas.
+    '''
+    def send_election_announcements(self):
+        for replica_id in self.others:
+            election_announcement = {"src": self.id, "dst": replica_id, "leader": self.get_leader(), "type": "election_announcement", "term": self.current_term}
+            self.send(election_announcement)
+
+    '''
+    Sends vote requests to all other replicas.
+    '''
+    def send_vote_requests(self):
+        for replica_id in self.others:
+            vote_request = {"src": self.id, "dst": replica_id, "leader": self.get_leader(), "type": "vote_request", "term": self.current_term}
+            self.send(vote_request)
+
+    '''
+    Sends a heartbeat message to all other replicas.
+    '''
+    def send_heartbeats(self):
+        for replica_id in self.others:
+            heartbeat = {"src": self.id, "dst": replica_id, "leader": self.get_leader(), "type": "heartbeat", "term": self.current_term}
+            self.send(heartbeat)
+            
+    def append_to_log(self, entry):
+        self.log.append(entry)
+
+    def apply_log_entries(self):
+        for i in range(self.last_applied + 1, len(self.log) + 1):
+            entry = self.log[i - 1]
+            if entry["type"] == "put":
+                key = entry["key"]
+                value = entry["value"]
+                self.datastore[key] = value
+            self.last_applied = i
+
+    '''
+    Sends an AppendEntries RPC message.
+    '''
+    def send_append_entries(self):
+        for replica_id in self.others:
+            prev_log_index = self.next_index[replica_id] - 1
+            if prev_log_index > 0:
+                prev_log_term = self.log[prev_log_index]["term"] 
+            else:
+                prev_log_term = 0 
+            entries = self.log[self.next_index[replica_id]:]
+            append_entries = {
+                "src": self.id, 
+                "dst": replica_id, 
+                "leader": self.get_leader(), 
+                "type": "append_entries", 
+                "term": self.current_term,
+                "prev_log_index": prev_log_index,
+                "prev_log_term": prev_log_term,
+                "entries": entries,
+                "leader_commit": self.commit_index}
+            self.send(append_entries)
+
+    '''
+    Processes a received AppendEntries RPC message request.
+    Params:
+        request: the request from the client
+    '''
+    def process_append_entries(self, request):
+        if request["term"] < self.current_term:
+            return
+        if request["term"] > self.current_term:
+            self.current_term = request["term"]
+            self.leader = request["src"]
+        self.process_heartbeat(request)
+        if request["prev_log_index"] > len(self.log):
+            return
+        if request["prev_log_index"] > 0 and self.log[request["prev_log_index"] - 1]["term"] != request["prev_log_term"]:
+            return
+        self.log = self.log[:request["prev_log_index"]] + request["entries"]
+        self.commit_index = min(request["leader_commit"], len(self.log))
+        if self.commit_index > self.last_applied:
+            self.apply_log_entries()
+        self.send({"src": self.id, "dst": request["src"], "leader": self.get_leader(), 
+                   "type": "append_entries_response", "term": self.current_term, "success": True})
+    
+
+
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='run a key-value store')
+    parser.add_argument('port', type=int, help="Port number to communicate")
+    parser.add_argument('id', type=str, help="ID of this replica")
+    parser.add_argument('others', metavar='others', type=str, nargs='+', help="IDs of other replicas")
+    args = parser.parse_args()
+    replica = Replica(args.port, args.id, args.others)
+    replica.run()
