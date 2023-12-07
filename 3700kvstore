@@ -21,8 +21,7 @@ class Replica:
         self.others = others
         # -- State --
         self.current_term = 0
-        self.log = []  
-        self.commit_index = 0
+        self.log = []   # log is a list of tuple of (entry, term) where term is the term of the leader when the entry was received
         self.last_applied = 0
         self.nextIndex = {}
         self.matchIndex = {}
@@ -33,6 +32,7 @@ class Replica:
         self.leader = BROADCAST
         self.last_heartbeat = time.time()
         self.datastore = {}
+        self.leader_acks = {}
 
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.socket.bind(('localhost', 0))
@@ -50,13 +50,11 @@ class Replica:
             for s in rlist:
                 data, addr = s.recvfrom(65535)
                 msg = data.decode('utf-8')
-                print("Received message '%s'" % (msg,), flush=True)
+                # print("Received message '%s'" % (msg,), flush=True)
                 request = json.loads(msg)
-
+                self.check_term(request)
                 if request["type"] in ["get", "put"]:
                     self.respond_to_client(request)
-                elif request["type"] == "hello":
-                    self.respond_to_raft_election(request)
                 elif request["type"] == "election_announcement":
                     self.process_election_announcement(request)
                 elif request["type"] == "vote_request":
@@ -65,13 +63,16 @@ class Replica:
                     self.process_vote(request)
                 elif request["type"] == "heartbeat":
                     self.process_heartbeat(request)
+                elif request["type"] == "append_entry":
+                    self.process_rpc(request)
+                elif request["type"] == "ack":
+                    self.process_ack(request)
             if self.leader != self.id:
                 self.check_leader_timeout()
             else:
                 self.send_heartbeats()
-                # self.send_append_entries()
             
-            
+    
     '''
     Sends a message to the client.
     Params:
@@ -90,63 +91,6 @@ class Replica:
             self.process_client_request(request)
 
     '''
-    If the election announcement is valid, this replica will enter the election state. Otherwise, it will ignore the message.
-    Params:
-        request: the request from the client
-    '''
-    def process_election_announcement(self, request):
-        if self.current_term < request["term"]:
-            self.ongoing_election = True
-            self.last_heartbeat = time.time()
-            self.current_term = request["term"]
-            self.leader = BROADCAST
-            self.voted_for = None
-            self.votes_received = 0
-            self.process_vote_request(request)
-    
-    '''
-    This replica will respond to the election announcement if it is a candidate or follower.
-    Params:
-        request: the request from the client
-    '''
-    def process_vote_request(self, request):
-        if self.current_term < request["term"]:
-            self.process_election_announcement(request)
-        if self.current_term == request["term"] and not self.voted_for and self.ongoing_election:
-            self.vote(request)
-
-    '''
-    Sends a vote message to the client who requested the vote.
-    Params:
-        request: the request from the client
-    '''
-    def vote(self, request):
-        vote = {
-            "src": self.id,
-            "dst": request['src'],
-            "leader": self.get_leader(),
-            "type": "vote",
-            "term": self.current_term
-        }
-        self.send(vote)
-        self.voted_for = request["src"]
-
-    '''
-    This method checks if the replica is the leader and sends a redirect message if it is not.
-    Params:
-        request: the request from the client
-    Returns:
-        True if the replica is the leader, False otherwise
-    '''
-    def check_redirect(self, request):
-        if self.id != self.leader:
-            redirect = {"src": self.id, "dst": request['src'], "leader": self.get_leader(), "type": "redirect", "MID": request['MID']}
-            self.send(redirect)
-            return False
-        else:
-            return True
-        
-    '''
     Returns the leader of the replica or "FFFF" if it is unknown.
     '''
     def get_leader(self):
@@ -160,11 +104,21 @@ class Replica:
             response = self.process_get_request(request)
         elif request["type"] == "put":
             response = self.process_put_request(request)
-        elif request['type'] == "":
-            response = self.respond_to_raft_election(request)
-        self.append_to_log(request)
+        self.append_to_log((request, self.current_term))
         self.apply_log_entries()
+        self.send_rpc()
         self.send(response)
+
+    '''
+    Processes the append entry message received from the leader.
+    Params:
+        request: the request from the leader
+    '''
+    def process_rpc(self, request):
+        if request["leader_commit"] > self.last_applied:
+            self.apply_log_entries(index=request["leader_commit"]) # Just apply entries up to the leader commit
+        self.append_to_log(request["entry"], request["term"]) 
+        self.send_ack_to_leader()
 
 
     '''
@@ -205,6 +159,21 @@ class Replica:
             self.end_election()
 
     '''
+    If the election announcement is valid, this replica will enter the election state. Otherwise, it will ignore the message.
+    Params:
+        request: the request from the client
+    '''
+    def process_election_announcement(self, request):
+        if self.current_term < request["term"]:
+            self.ongoing_election = True
+            self.last_heartbeat = time.time()
+            self.current_term = request["term"]
+            self.leader = BROADCAST
+            self.voted_for = None
+            self.votes_received = 0
+            self.process_vote_request(request)  
+
+    '''
     Processes the vote message received.
     Params:
         request: the request from the client
@@ -218,22 +187,21 @@ class Replica:
                 self.send_heartbeats()
 
     '''
-    Exits the election state for this replica.
+    This replica will respond to the election announcement with a vote if it is a candidate or follower.
+    Params:
+        request: the request from the client
     '''
-    def end_election(self):
-        self.ongoing_election = False
-        self.voted_for = None
-        self.votes_received = 0
-        self.election_timeout = random.randint(150, 300) / 1000
+    def process_vote_request(self, request):
+        if self.current_term == request["term"] and not self.voted_for and self.ongoing_election:
+            self.vote(request)
 
-
     '''
-    This method checks if the leader has timed out and starts a new election if it has.
+    Processes the acknowledgement message from a replica.
+    Params:
+        request: the request from the client
     '''
-    def check_leader_timeout(self):
-        current_time = time.time()
-        if current_time - self.last_heartbeat > self.election_timeout:
-            self.start_election()
+    def process_ack(self, request):
+        self.leader_acks[request["src"]] = True
 
     '''
     Starts a new election by making itself a candidate and sending out election announcements and vote requests.
@@ -247,6 +215,15 @@ class Replica:
         self.votes_received = 1
         self.send_election_announcements()
         # self.send_vote_requests()
+
+    '''
+    Exits the election state for this replica.
+    '''
+    def end_election(self):
+        self.ongoing_election = False
+        self.voted_for = None
+        self.votes_received = 0
+        self.election_timeout = random.randint(150, 300) / 1000
 
     '''
     Sends election announcements to all other replicas.
@@ -272,20 +249,110 @@ class Replica:
             heartbeat = {"src": self.id, "dst": replica_id, "leader": self.get_leader(), "type": "heartbeat", "term": self.current_term}
             self.send(heartbeat)
 
-    def append_to_log(self, entry):
-        self.log.append(entry)
+    '''
+    Sends a non-specified acknowledgement to the leader.
+    '''
+    def send_ack_to_leader(self):
+        ack = {"src": self.id, "dst": self.leader, "leader": self.get_leader(), "type": "ack", "term": self.current_term}
+        self.send(ack)
 
-    def apply_log_entries(self):
-        for i in range(self.last_applied + 1, len(self.log) + 1):
-            entry = self.log[i - 1]
+    '''
+    Sends a vote message to the client who requested the vote.
+    Params:
+        request: the request from the client
+    '''
+    def vote(self, request):
+        vote = {
+            "src": self.id,
+            "dst": request['src'],
+            "leader": self.get_leader(),
+            "type": "vote",
+            "term": self.current_term
+        }
+        self.send(vote)
+        self.voted_for = request["src"]
+
+    '''
+    Appends the entry to the log with either the given term or the replicas current term.
+    Params:
+        entry: the entry to append
+        term: the term of the entry
+    '''
+    def append_to_log(self, entry, term=None):
+        self.log.append((entry, self.current_term if term is None else term))
+
+    '''
+    Applies all log entries that have not been applied yet or up to a given index if specified.
+    Params:
+        end_index: the index up to which to apply the log entries'''
+    def apply_log_entries(self, end_index=None):
+        end = len(self.log) + 1 if end_index is None else end_index + 1
+        for i in range(self.last_applied + 1, end):
+            entry = self.log[i - 1][0][0]
+            print(entry)
             if entry["type"] == "put":
                 key = entry["key"]
                 value = entry["value"]
                 self.datastore[key] = value
             self.last_applied = i
 
+    '''
+    Sends the entry logs to be replicated to all other replicas. 
+    '''
+    def send_rpc(self):
+        uuid = str(uuid.uuid4())
+        prev_index = len(self.log) - 1
+        append_entry = {"src": self.id, 
+                        "dst": replica_id, 
+                        "leader": self.get_leader(), 
+                        "type": "append_entry", 
+                        "term": self.current_term, 
+                        "entries": self.log[prev_index+1:],
+                        "leader_commit": self.last_applied, 
+                        "leader_log": self.log,
+                        "prev_log_index": prev_index,
+                        "prev_log_term": self.log[prev_index][1],
+                        "uuid": uuid}
+        for replica_id in self.others:
+            self.send(append_entry)
 
+    '''
+    This method checks if the leader has timed out and starts a new election if it has.
+    '''
+    def check_leader_timeout(self):
+        current_time = time.time()
+        if current_time - self.last_heartbeat > self.election_timeout:
+            self.start_election()
 
+    '''
+    Checks if the term of the request is greater than the current term and updates the current term if it is.
+    Params:
+        request: the request from the client
+    '''
+    def check_term(self, request):
+        if request["term"] > self.current_term:
+            self.current_term = request["term"]
+            self.leader = request["leader"]
+            self.voted_for = None
+            self.votes_received = 0
+            self.last_heartbeat = time.time()
+            self.election_timeout = random.randint(150, 300) / 1000
+
+    '''
+    This method checks if the replica is the leader and sends a redirect message if it is not.
+    Params:
+        request: the request from the client
+    Returns:
+        True if the replica is the leader, False otherwise
+    '''
+    def check_redirect(self, request):
+        if self.id != self.leader:
+            redirect = {"src": self.id, "dst": request['src'], "leader": self.get_leader(), "type": "redirect", "MID": request['MID']}
+            self.send(redirect)
+            return False
+        else:
+            return True
+        
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='run a key-value store')
