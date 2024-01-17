@@ -5,15 +5,17 @@ import socket
 import time
 import json
 import select
-import struct
-import sys
-import math
-import os
 import random
 
 BROADCAST = "FFFF"
+FOLLOWER = "follower"
+CANDIDATE = "candidate"
+LEADER = "leader"
 replica_ids = ['0000', '0001', '0002', '0003', '0004']
 
+'''
+Represents a replica in the key-value store using the raft protocol.
+'''
 class Replica:
     def __init__(self, port, id, others):
         # -- Starter Code --
@@ -23,31 +25,26 @@ class Replica:
         # -- State --
         self.term = 0
         self.log = [{'src': '', 'key': '', 'value': '', 'MID': '', 'term': 0}]
-        self.election_timeout = random.randint(150, 300) / 1000
         self.ongoing_election = False
         self.votedFor = ''
         self.votes = 0
-        self.role = 'follower'
+        self.role = FOLLOWER
         self.leader = BROADCAST
         self.last_heartbeat = time.time()
         self.database = {}
-        
-
         self.last = time.time()
-
-        self.SELECT_WAIT_TIME = 0.01  # 10 milliseconds
-        self.buffer = b''
-
-
 
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.socket.bind(('localhost', 0))
 
         print("Replica %s starting up" % self.id, flush=True)
-        hello = {"src": self.id, "dst": BROADCAST, "leader": BROADCAST, "type": "hello"}
+        hello = {"src": self.id, "dst": BROADCAST, LEADER: BROADCAST, "type": "hello"}
         self.send(hello)
         print("Sent hello message: %s" % hello, flush=True)
 
+    '''
+    Runs the replica
+    '''
     def run(self):
         while True:
             rlist, _, _ = select.select([self.socket], [], [], 0.1)
@@ -56,100 +53,93 @@ class Replica:
                 full_message = data.decode('utf-8')
                 print("Received message '%s'" % (full_message), flush=True)
                 msg = json.loads(full_message)
-
                 if msg['type'] == 'get':
                     self.handle_get(msg)
-
                 elif msg['type'] == 'put':
                     self.handle_put(msg)
-
-                elif msg['type'] == 'RequestVote RPC':
+                elif msg['type'] == 'req_vote':
                     self.handle_request_vote(msg)
-
-                elif msg['type'] == 'VoteTrue':
+                elif msg['type'] == 'vote_t':
                     self.handle_vote(msg)
-
-                elif msg['type'] == 'VoteFalse':
+                elif msg['type'] == 'vote_f':
                     self.handle_rejected_vote(msg)
+                elif msg['type'] == 'app_rpc':
+                    self.last = time.time()
+                    self.handle_append_entries(msg)   
+            clock = time.time()
+            if clock - self.last > 0.5 and self.role == LEADER:
+                self.handle_leader_beat(clock)
+            if clock - self.last > 3 and self.role != LEADER:
+                self.handle_not_leader_beat(clock)
 
-                elif msg['type'] == 'AppendEntries RPC':
-                    last = time.time()
-                    self.handle_append_entries(msg)
+    '''
+    Handles a heartbeat if the leader.
+    Params:
+        clock: the current time
+    '''
+    def handle_leader_beat(self, clock):
+        self.send_append_entries(replica_ids)
+        self.last = clock
 
+    '''
+    Handles a heartbeat if not the leader.
+    Params:
+        clock: the current time
+    '''
+    def handle_not_leader_beat(self, clock):
+        self.start_election()
+        self.last = clock
 
-            """  if request["type"] in ["get", "put"]:
-                    self.respond_to_client(request)
-                elif request["type"] == "hello":
-                    self.respond_to_raft_election(request)
-                elif request["type"] == "election_announcement":
-                    self.process_election_announcement(request)
-                elif request["type"] == "vote_request":
-                    self.process_vote_request(request)
-                elif request["type"] == "vote":
-                    self.process_vote(request)
-                elif request["type"] == "heartbeat":
-                    self.process_heartbeat(request)
-            if self.leader != self.id:
-                self.check_leader_timeout()
-            else:
-                self.send_heartbeats()
-                # self.send_append_entries() """
-            
-
-    def handle_get(self, get_msg):
-        key = get_msg['key']
-
-        # if I am the leader, reply to the get
-        if self.role == 'leader' and self.leader == self.id:
-
-            get_reply = {"src": self.id,
-                        "dst": get_msg['src'],
+    '''
+    Handles a get request from the client.
+    Params:
+        msg: the message from the client
+    '''
+    def handle_get(self, msg):
+        key = msg['key']
+        if self.role == LEADER and self.leader == self.id:
+            reply = {"src": self.id,
+                        "dst": msg['src'],
                         "leader": self.leader,
                         "type": "ok",
-                        "MID": get_msg['MID'],
+                        "MID": msg['MID'],
                         "value": ''}
-
-            # ok with value if in
             if key in self.database.keys():
                 value = self.database[key]
-                get_reply['value'] = value
-                self.send(get_reply)
+                reply['value'] = value
+                self.send(reply)
             else:
-                get_reply = {"src": self.id,
-                            "dst": get_msg['src'],
+                self.send({"src": self.id,
+                            "dst": msg['src'],
                             "leader": self.leader,
                             "type": "fail",
-                            "MID": get_msg['MID']}
-                self.send(get_reply)
+                            "MID": msg['MID']})
         else:
-            get_redirect_msg = {"src": self.id,
-                                "dst": get_msg['src'],
+            self.send({"src": self.id,
+                                "dst": msg['src'],
                                 "leader": self.leader,
                                 "type": "redirect",
-                                "MID": get_msg['MID']}
-            self.send(get_redirect_msg)
+                                "MID": msg['MID']})
 
+    '''
+    Handles a put request from the client.
+    Params:
+        put_msg: the message from the client    
+    '''
     def handle_put(self, put_msg):
 
         # if this socket is the leader
-        if self.role == 'leader' and self.leader == self.id:
+        if self.role == LEADER and self.leader == self.id:
             self.database[put_msg['key']] = put_msg['value']
             self.log.append({'src': put_msg['src'],
                         'key': put_msg['key'],
                         'value': put_msg['value'],
                         'MID': put_msg['MID'],
                         'term': self.term})
-
-            append_entries_message = {"src": self.id, "dst": 'Null', "leader": self.leader, "type": "AppendEntries RPC",
-                                    "MID": put_msg['MID'], "key": put_msg['key'], "value": put_msg['value']}
-            i = 0
-            while i < 2:
-                self.send_to_all(append_entries_message)
-                i += 1
-
-            ok_put_message = {"src": self.id, "dst": put_msg['src'], "leader": self.leader, "type": "ok", "MID": put_msg['MID']}
-            self.send(ok_put_message)
-
+            for _ in range(2):
+                self.send_to_all({"src": self.id, "dst": 'Null', "leader": self.leader, "type": "app_rpc",
+                                    "MID": put_msg['MID'], "key": put_msg['key'], "value": put_msg['value']})
+            self.send({"src": self.id, "dst": put_msg['src'], "leader": self.leader, "type": "ok", "MID": put_msg['MID']})
         else:
             if self.leader == 'FFFF':
                 self.start_election()
@@ -161,96 +151,105 @@ class Replica:
                                 "type": "redirect",
                                 "MID": put_msg['MID']}
                 self.send(redirect_put_msg)
-                print(" redirected a put request + current role and leader are " + str(self.leader) + self.state)
+                # print(" redirected a put request + current role and leader are " + str(self.leader) + self.role)
             
-    
-
+    '''
+    Starts a new election and makes itself a candidate.
+    '''
     def start_election(self):
-        # increments its current term and transitions to candidate state.
         self.term += 1
-        self.role = 'candidate'
-
-        # It then votes for itself and issues RequestVote RPCs
-        votedFor = self.id
+        self.role = CANDIDATE
+        self.votedFor = self.id
         self.votes += 1
-
         request_vote_msg = {'src': self.id,
                             'dst': "NULL",
                             'leader': self.leader,
-                            'type': 'RequestVote RPC',
+                            'type': 'req_vote',
                             'term': self.term,
                             'candidate_id': self.id,
                             }
-
-        print(request_vote_msg)
-        # broadcast the request vote rpc to all replicas
+        # print(request_vote_msg)
         self.send_to_all(request_vote_msg)
 
+    '''
+    Handles a request vote message.
+    Params:
+        request_vote_msg: the request vote message
+    '''
     def handle_request_vote(self, request_vote_msg):
-        print("Received a request vote from " + request_vote_msg['src'])
+        # print("Received a request vote from " + request_vote_msg['src'])
         request_vote_reply = {'src': self.id,
                             'dst': request_vote_msg['src'],
                             'leader': self.leader,
                             'type': 'Null',
                             'term': self.term
                             }
-
         if self.votedFor == '':
-            request_vote_reply['type'] = 'VoteTrue'
+            request_vote_reply['type'] = 'vote_t'
             self.votedFor = request_vote_msg['src']
             self.send(request_vote_reply)
-            print(str(self.id) + " sent a vote to " + str(request_vote_reply['dst']))
+            # print(str(self.id) + " sent a vote to " + str(request_vote_reply['dst']))
         else:
-            request_vote_reply['type'] = 'VoteFalse'
+            request_vote_reply['type'] = 'vote_f'
             self.send(request_vote_reply)
-            print("Already voted for " + str(self.votedFor))
+            # print("Already voted for " + str(self.votedFor))
 
+    '''
+    Handles a vote from a replica.
+    Params:
+        vote_true_msg: true_msg from client, only used for testing
+        '''
     def handle_vote(self, vote_true_msg):
         self.votes += 1
-
-        print(str(self.id) + " received a vote from " + vote_true_msg['src'])
-
-        # if majority of votes
+        # print(str(self.id) + " received a vote from " + vote_true_msg['src'])
         if self.votes >= len(replica_ids) / 2:
             self.leader = self.id
-            self.role = 'leader'
-
-            # reset global variables
+            self.role = LEADER
             self.votes = 0
             self.send_append_entries(replica_ids)
 
+    '''
+    Sends an AppendEntriesRPC to the given destinations.
+    Params:
+        destination: the destinations of the RPC
+    '''
     def send_append_entries(self, destination):
-        if self.leader == self.id and self.role == 'leader':
+        if self.leader == self.id and self.role == LEADER:
             for replica_id in destination:
-                append_entries_msg = {
+                self.send({
                     'src': self.id,
                     'dst': replica_id,
-                    'type': 'AppendEntries RPC',
+                    'type': 'app_rpc',
                     'leader': self.leader,
                     'term': self.term,
                     "key": '', "value": ''
-                }
-                self.send(append_entries_msg)
+                })
+                # print(str(self.id) + " sent append entry RPC to " + str(replica_id))
 
-                print(str(self.id) + " sent append entry RPC to " + str(replica_id))
-
+    '''
+    Handles a rejected vote.
+    Params:
+        rejection_msg: the rejection message from the replica
+    '''
     def handle_rejected_vote(self, rejection_msg):
-        if self.role == 'candidate' and rejection_msg['term'] >= self.term:
+        if self.role == CANDIDATE and rejection_msg['term'] >= self.term:
             self.term = rejection_msg['term']
-            self.role = 'follower'
-
-            # reset election variable
+            self.role = FOLLOWER
             self.votes = 0
             self.votedFor = ''
             self.leader = rejection_msg['leader']
 
+    '''
+    Handles an append entries RPC message.
+    Params:
+        append_entries_rpc: the append entries RPC message
+    '''
     def handle_append_entries(self, append_entries_rpc):
         if append_entries_rpc['key'] == '' or append_entries_rpc['value'] == '':
-            # heartbeat
-            votedFor = ''
+            self.votedFor = ''
             if self.leader == 'FFFF' or not self.leader == append_entries_rpc['leader']:
                 self.leader = append_entries_rpc['leader']
-                help(str(self.id) + " set leader to " + str(self.leader))
+                # print(str(self.id) + " set leader to " + str(self.leader))
         else:
             self.database[append_entries_rpc['key']] = append_entries_rpc['value']
 
@@ -262,101 +261,24 @@ class Replica:
     def send(self, message):
         self.socket.sendto(json.dumps(message).encode('utf-8'), ('localhost', self.port))
 
+    '''
+    Sends a message to all replicas.
+    Params:
+        send_to_all_msg: the message to send
+    '''
     def send_to_all(self, send_to_all_msg):
         for replica_id in replica_ids:
             send_to_all_msg['dst'] = replica_id
             self.send(send_to_all_msg)
-            print(str(self.id) + " sent " + str(send_to_all_msg))
+            # print(str(self.id) + " sent " + str(send_to_all_msg))
+
     '''
-    Responds to a client request if this replica is the leader.
+    Appends an entry to the log.
     Params:
-        request: the request from the client
+        entry: the entry to append
     '''
-    def respond_to_client(self, request):
-        if self.check_redirect(request):
-            self.process_client_request(request)
-
-    '''
-    This method checks if the replica is the leader and sends a redirect message if it is not.
-    Params:
-        request: the request from the client
-    Returns:
-        True if the replica is the leader, False otherwise
-    '''
-    def check_redirect(self, request):
-        if self.id != self.leader:
-            redirect = {"src": self.id, "dst": request['src'], "leader": self.get_leader(), "type": "redirect", "MID": request['MID']}
-            self.send(redirect)
-            return False
-        else:
-            return True
-        
-    '''
-    Returns the leader of the replica or "FFFF" if it is unknown.
-    '''
-    def get_leader(self):
-        return self.leader if self.leader else BROADCAST
-
-    '''
-    This leader processes the client request and send back a response.
-    '''
-    def process_client_request(self, request):
-        if request["type"] == "get":
-            response = self.process_get_request(request)
-        elif request["type"] == "put":
-            response = self.process_put_request(request)
-        elif request['type'] == "":
-            response = self.respond_to_raft_election(request)
-        self.append_to_log(request)
-        self.apply_log_entries()
-        self.send(response)
-
-
-    '''
-    Attempts to send back a response with the key and value.
-    Params:
-        request: the request from the client
-    Returns:
-        Either an 'ok' message or a 'fail' message
-    '''
-    def process_get_request(self, request):
-        val = ""
-        try:
-            val = self.database.get(request["key"])           
-        except KeyError:
-            pass
-        return {"src": self.id, "dst": request['src'], "leader": self.get_leader(), "type": "ok", "MID": request['MID'],
-                "value": val}
-
-    '''
-    Attempts to enter the given key-value pair into the database.
-    Params:
-        request: the request from the client
-    '''
-    def process_put_request(self, request):
-        try:
-            self.database[request["key"]] = request["value"]
-        except KeyError:
-            pass
-        return {"src": self.id, "dst": request['src'], "leader": self.get_leader(), "type": "ok", "MID": request['MID']}
-    
-    '''
-    Processes the heartbeat message received from the leader.
-    '''
-    def process_heartbeat(self, request):
-        self.last_heartbeat = time.time()
-        self.leader = request["leader"]
-        if self.ongoing_election:
-            self.end_election()
-
-
     def append_to_log(self, entry):
         self.log.append(entry)
-    
-    
-
-
-
 
 
 if __name__ == "__main__":
@@ -367,4 +289,3 @@ if __name__ == "__main__":
     args = parser.parse_args()
     replica = Replica(args.port, args.id, args.others)
     replica.run()
-
