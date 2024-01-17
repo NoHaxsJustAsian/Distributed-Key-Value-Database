@@ -1,5 +1,5 @@
 
-*Joseph Pierre-Louis & Tunwa Tongtawee - CS3700 - 12/10/2023*
+* Tunwa Tongtawee & Joseph Pierre-Louis - CS3700 - 12/10/2023*
 # Project 6 - 
 
 
