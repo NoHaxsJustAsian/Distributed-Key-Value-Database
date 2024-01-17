@@ -51,7 +51,7 @@ class Replica:
             for s in rlist:
                 data, addr = s.recvfrom(65535)
                 full_message = data.decode('utf-8')
-                print("Received message '%s'" % (full_message), flush=True)
+                #print("Received message '%s'" % (full_message), flush=True)
                 msg = json.loads(full_message)
                 if msg['type'] == 'get':
                     self.handle_get(msg)
